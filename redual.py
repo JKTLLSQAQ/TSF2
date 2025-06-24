@@ -1,609 +1,441 @@
-from exp.exp_basic import Exp_Basic
-from models import dual  # 修改：导入新的双分支模型
-from data_provider.data_factory import data_provider
-from utils.tools import EarlyStopping, adjust_learning_rate
-from utils.metrics import metric
 import torch
 import torch.nn as nn
-from torch import optim
-import os
-import time
-import warnings
+import torch.nn.functional as F
 import numpy as np
-import pandas as pd
-from torch.optim import lr_scheduler
-from tqdm import tqdm
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-from datetime import datetime
-import seaborn as sns
-
-warnings.filterwarnings('ignore')
+from layers.Autoformer_EncDec import series_decomp
+from layers.Embed import DataEmbedding_wo_pos
+from layers.StandardNorm import Normalize
+from layers.ChebyKANLayer import ChebyKANLinear
+from layers.TimeDART_EncDec import Diffusion
 
 
-def generate_timestamp():
-    """生成时间戳字符串"""
-    return datetime.now().strftime("%Y%m%d_%H%M%S")
+class ChannelAttentionModule(nn.Module):
+    """通道注意力机制 - 放在模型最前端"""
+
+    def __init__(self, channels, reduction=8):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        self.max_pool = nn.AdaptiveMaxPool1d(1)
+
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels, bias=False)
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        # x: [B, T, C]
+        B, T, C = x.shape
+
+        # 全局平均池化和最大池化
+        avg_out = self.fc(self.avg_pool(x.transpose(1, 2)).squeeze(-1))  # [B, C]
+        max_out = self.fc(self.max_pool(x.transpose(1, 2)).squeeze(-1))  # [B, C]
+
+        # 注意力权重
+        attention_weights = self.sigmoid(avg_out + max_out).unsqueeze(1)  # [B, 1, C]
+
+        # 应用注意力权重
+        return x * attention_weights
 
 
-def generate_detailed_timestamp():
-    """生成详细的时间戳字符串"""
-    return datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+class FourierBlock(nn.Module):
+    """频域特征提取模块（基于论文中的FNN设计）"""
 
+    def __init__(self, d_model, seq_len):
+        super().__init__()
+        self.d_model = d_model
+        self.seq_len = seq_len
 
-class Exp_Fused_Forecast(Exp_Basic):
-    def __init__(self, args):
-        super(Exp_Fused_Forecast, self).__init__(args)
-        self.experiment_timestamp = generate_timestamp()
-        self.detailed_timestamp = generate_detailed_timestamp()
-        print(f"实验时间戳: {self.experiment_timestamp}")
-        print(f"详细时间戳: {self.detailed_timestamp}")
+        # 频域映射层
+        self.freq_mapping = nn.Linear(d_model, d_model)
 
-    def _build_model(self):
-        model = self.model_dict[self.args.model].Model(self.args).float()
-        if self.args.use_multi_gpu and self.args.use_gpu:
-            model = nn.DataParallel(model, device_ids=self.args.device_ids)
-        return model
+        # 多头自注意力机制用于频域特征学习
+        self.multihead_attn = nn.MultiheadAttention(d_model, num_heads=8, dropout=0.1, batch_first=True)
 
-    def _get_data(self, flag):
-        data_set, data_loader = data_provider(self.args, flag)
-        return data_set, data_loader
-
-    def _select_optimizer(self):
-        model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
-        return model_optim
-
-    def _select_criterion(self):
-        criterion = nn.MSELoss()
-        return criterion
-
-    def vali(self, vali_data, vali_loader, criterion):
-        total_loss = []
-        preds = []
-        trues = []
-
-        self.model.eval()
-        with torch.no_grad():
-            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(vali_loader):
-                batch_x = batch_x.float().to(self.device)
-                batch_y = batch_y.float().to(self.device)
-                batch_x_mark = batch_x_mark.float().to(self.device)
-                batch_y_mark = batch_y_mark.float().to(self.device)
-
-                # 模型前向
-                outputs = self.model(batch_x, batch_x_mark, None, batch_y_mark)
-
-                # 修复：在使用f_dim之前先定义它
-                f_dim = -1 if self.args.features == 'MS' else 0
-                outputs = outputs[:, -self.args.pred_len:, f_dim:]
-                batch_y = batch_y[:, -self.args.pred_len:, f_dim:]
-
-                loss = criterion(outputs, batch_y)
-                total_loss.append(loss.item())
-
-                # 收集预测和真实值用于计算R²
-                preds.append(outputs.detach().cpu().numpy())
-                trues.append(batch_y.detach().cpu().numpy())
-
-        total_loss = np.average(total_loss)
-
-        # 计算验证集上的R²
-        preds = np.concatenate(preds, axis=0)
-        trues = np.concatenate(trues, axis=0)
-        _, _, _, _, _ = metric(preds, trues)
-        from sklearn.metrics import r2_score
-        r2 = r2_score(trues.flatten(), preds.flatten())
-
-        self.model.train()
-        return total_loss, r2
-
-    def train(self, setting):
-        train_data, train_loader = self._get_data(flag='train')
-        vali_data, vali_loader = self._get_data(flag='val')
-        test_data, test_loader = self._get_data(flag='test')
-
-        # 修改：添加时间戳到路径
-        timestamped_setting = f"{setting}_{self.experiment_timestamp}"
-        path = os.path.join(self.args.checkpoints, timestamped_setting)
-        if not os.path.exists(path):
-            os.makedirs(path)
-
-        time_now = time.time()
-        train_steps = len(train_loader)
-
-        # 设置早停patience为5，最大epoch为25
-        early_stopping = EarlyStopping(patience=5, verbose=True)
-        max_epochs = 25
-
-        model_optim = self._select_optimizer()
-        criterion = self._select_criterion()
-
-        scheduler = lr_scheduler.OneCycleLR(
-            optimizer=model_optim,
-            steps_per_epoch=train_steps,
-            pct_start=self.args.pct_start,
-            epochs=max_epochs,
-            max_lr=self.args.learning_rate
+        # 频域特征变换
+        self.freq_transform = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.GELU(),
+            nn.Linear(d_model * 2, d_model),
+            nn.Dropout(0.1)
         )
 
-        # 记录训练历史
-        train_history = {
-            'train_loss': [],
-            'vali_loss': [],
-            'vali_r2': [],
-            'test_loss': [],
-            'test_r2': []
+        # 逆FFT后的处理
+        self.ifft_proj = nn.Linear(d_model, d_model)
+
+    def forward(self, x):
+        # x: [B, T, C]
+        B, T, C = x.shape
+
+        # 映射到高维空间
+        x_mapped = self.freq_mapping(x)
+
+        # FFT变换到频域
+        x_freq = torch.fft.rfft(x_mapped, dim=1)  # [B, T//2+1, C]
+        x_freq_real = torch.cat([x_freq.real, x_freq.imag], dim=-1)  # [B, T//2+1, 2C]
+
+        # 调整维度以匹配d_model
+        if x_freq_real.shape[-1] != self.d_model:
+            # 创建一个可学习的线性层来调整维度
+            if not hasattr(self, 'freq_dim_adapter'):
+                self.freq_dim_adapter = nn.Linear(x_freq_real.shape[-1], self.d_model).to(x.device)
+            x_freq_real = self.freq_dim_adapter(x_freq_real)
+
+        # 自注意力机制学习频域特征
+        freq_attn_out, _ = self.multihead_attn(x_freq_real, x_freq_real, x_freq_real)
+
+        # 频域特征变换
+        freq_features = self.freq_transform(freq_attn_out)
+
+        # IFFT回到时域
+        # 处理维度以进行IFFT
+        if freq_features.shape[-1] >= self.d_model // 2:
+            # 分离实部和虚部
+            half_dim = freq_features.shape[-1] // 2
+            freq_real = freq_features[..., :half_dim]
+            freq_imag = freq_features[..., half_dim:half_dim * 2] if freq_features.shape[
+                                                                         -1] > half_dim else torch.zeros_like(freq_real)
+            freq_complex = torch.complex(freq_real, freq_imag)
+        else:
+            # 如果维度不足，用零填充虚部
+            freq_complex = torch.complex(freq_features, torch.zeros_like(freq_features))
+
+        # 确保频域序列长度正确
+        if freq_complex.shape[1] != (T // 2 + 1):
+            # 调整频域序列长度
+            target_freq_len = T // 2 + 1
+            current_freq_len = freq_complex.shape[1]
+            if current_freq_len > target_freq_len:
+                freq_complex = freq_complex[:, :target_freq_len, :]
+            else:
+                # 用零填充
+                pad_len = target_freq_len - current_freq_len
+                pad_tensor = torch.zeros(freq_complex.shape[0], pad_len, freq_complex.shape[2],
+                                         dtype=freq_complex.dtype, device=freq_complex.device)
+                freq_complex = torch.cat([freq_complex, pad_tensor], dim=1)
+
+        x_ifft = torch.fft.irfft(freq_complex, n=T, dim=1)  # [B, T, C]
+
+        # 最终投影，确保输出维度与输入一致
+        if x_ifft.shape[-1] != C:
+            if not hasattr(self, 'output_adapter'):
+                self.output_adapter = nn.Linear(x_ifft.shape[-1], C).to(x.device)
+            x_ifft = self.output_adapter(x_ifft)
+
+        return self.ifft_proj(x_ifft)
+
+
+class LightweightDiffusion(nn.Module):
+    """轻量级扩散模块"""
+
+    def __init__(self, time_steps=20, device='cuda', scheduler='linear'):
+        super().__init__()
+        self.diffusion = Diffusion(time_steps=time_steps, device=device, scheduler=scheduler)
+
+    def forward(self, x, apply_noise=True):
+        if apply_noise and self.training:
+            return self.diffusion(x)
+        else:
+            return x, None, None
+
+
+class AdaptiveKANMixer(nn.Module):
+    """自适应KAN混合器"""
+
+    def __init__(self, d_model, component_type='trend'):
+        super().__init__()
+        # 根据分量类型选择KAN阶数
+        order_map = {'trend': 3, 'seasonal': 5, 'residual': 4}
+        order = order_map.get(component_type, 4)
+
+        self.kan_layer = ChebyKANLinear(d_model, d_model, order)
+        self.conv = nn.Conv1d(d_model, d_model, kernel_size=3, padding=1, groups=d_model)
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, x):
+        B, T, C = x.shape
+        x_kan = self.kan_layer(x.reshape(B * T, C)).reshape(B, T, C)
+        x_conv = self.conv(x.transpose(1, 2)).transpose(1, 2)
+        return self.norm(x + x_kan + x_conv)
+
+
+class TimeDomainBranch(nn.Module):
+    """时域分支（独立预测）"""
+
+    def __init__(self, configs):
+        super().__init__()
+        self.configs = configs
+
+        # KAN混合器
+        self.trend_mixer = AdaptiveKANMixer(configs.d_model, 'trend')
+        self.seasonal_mixer = AdaptiveKANMixer(configs.d_model, 'seasonal')
+        self.residual_mixer = AdaptiveKANMixer(configs.d_model, 'residual')
+
+        # 轻量级扩散（仅用于seasonal）
+        self.diffusion = LightweightDiffusion(time_steps=20, device=configs.device)
+
+        # 特征融合
+        self.feature_fusion = nn.Linear(configs.d_model * 3, configs.d_model)
+
+        # 时域预测头
+        self.temporal_predictor = nn.Linear(configs.seq_len, configs.pred_len)
+
+        # 输出投影
+        if configs.channel_independence == 1:
+            self.output_projection = nn.Linear(configs.d_model, 1)
+        else:
+            self.output_projection = nn.Linear(configs.d_model, configs.c_out)
+
+    def forward(self, seasonal_emb, trend_emb, residual_emb):
+        # 分量处理
+        trend_out = self.trend_mixer(trend_emb)
+
+        # seasonal加入扩散噪声
+        if self.training:
+            seasonal_noise, _, _ = self.diffusion(seasonal_emb, apply_noise=True)
+            seasonal_out = self.seasonal_mixer(seasonal_noise)
+        else:
+            seasonal_out = self.seasonal_mixer(seasonal_emb)
+
+        residual_out = self.residual_mixer(residual_emb)
+
+        # 特征融合
+        combined = torch.cat([trend_out, seasonal_out, residual_out], dim=-1)
+        time_features = self.feature_fusion(combined)
+
+        # 时域预测
+        time_pred = self.temporal_predictor(time_features.transpose(1, 2)).transpose(1, 2)
+        time_output = self.output_projection(time_pred)
+
+        return time_output, time_features
+
+
+class FrequencyDomainBranch(nn.Module):
+    """频域分支（独立预测）"""
+
+    def __init__(self, configs):
+        super().__init__()
+        self.configs = configs
+
+        # 频域处理器
+        self.fourier_trend = FourierBlock(configs.d_model, configs.seq_len)
+        self.fourier_seasonal = FourierBlock(configs.d_model, configs.seq_len)
+        self.fourier_residual = FourierBlock(configs.d_model, configs.seq_len)
+
+        # 频域特征融合
+        self.freq_fusion = nn.Sequential(
+            nn.Linear(configs.d_model * 3, configs.d_model * 2),
+            nn.GELU(),
+            nn.Linear(configs.d_model * 2, configs.d_model),
+            nn.Dropout(0.1)
+        )
+
+        # 频域预测头
+        self.temporal_predictor = nn.Linear(configs.seq_len, configs.pred_len)
+
+        # 输出投影
+        if configs.channel_independence == 1:
+            self.output_projection = nn.Linear(configs.d_model, 1)
+        else:
+            self.output_projection = nn.Linear(configs.d_model, configs.c_out)
+
+    def forward(self, seasonal_emb, trend_emb, residual_emb):
+        # 频域处理
+        trend_freq = self.fourier_trend(trend_emb)
+        seasonal_freq = self.fourier_seasonal(seasonal_emb)
+        residual_freq = self.fourier_residual(residual_emb)
+
+        # 频域特征融合
+        combined_freq = torch.cat([trend_freq, seasonal_freq, residual_freq], dim=-1)
+        freq_features = self.freq_fusion(combined_freq)
+
+        # 频域预测
+        freq_pred = self.temporal_predictor(freq_features.transpose(1, 2)).transpose(1, 2)
+        freq_output = self.output_projection(freq_pred)
+
+        return freq_output, freq_features
+
+
+class PredictionLevelAttention(nn.Module):
+    """预测级注意力融合模块"""
+
+    def __init__(self, configs):
+        super().__init__()
+        self.configs = configs
+
+        # 注意力计算网络
+        if configs.channel_independence == 1:
+            input_dim = 1
+        else:
+            input_dim = configs.c_out
+
+        self.attention_net = nn.Sequential(
+            nn.Linear(input_dim * 2 + configs.d_model * 2, configs.d_model),
+            nn.ReLU(),
+            nn.Linear(configs.d_model, configs.d_model // 2),
+            nn.ReLU(),
+            nn.Linear(configs.d_model // 2, 2),  # 2个分支的权重
+            nn.Softmax(dim=-1)
+        )
+
+        # 置信度估计网络
+        self.confidence_net = nn.Sequential(
+            nn.Linear(configs.d_model, configs.d_model // 2),
+            nn.ReLU(),
+            nn.Linear(configs.d_model // 2, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, time_pred, freq_pred, time_features, freq_features):
+        """
+        Args:
+            time_pred: [B, pred_len, C] 时域预测
+            freq_pred: [B, pred_len, C] 频域预测
+            time_features: [B, seq_len, d_model] 时域特征
+            freq_features: [B, seq_len, d_model] 频域特征
+        """
+        B, pred_len = time_pred.shape[:2]
+
+        # 计算全局特征（用于注意力计算）
+        time_global = time_features.mean(dim=1)  # [B, d_model]
+        freq_global = freq_features.mean(dim=1)  # [B, d_model]
+
+        # 计算预测差异（作为注意力的输入）
+        pred_diff = torch.abs(time_pred - freq_pred).mean(dim=1)  # [B, C]
+
+        # 拼接所有特征
+        attention_input = torch.cat([
+            time_global, freq_global,
+            pred_diff, (time_pred + freq_pred).mean(dim=1)
+        ], dim=-1)  # [B, d_model*2 + C*2]
+
+        # 计算注意力权重
+        attention_weights = self.attention_net(attention_input)  # [B, 2]
+
+        # 计算置信度
+        time_conf = self.confidence_net(time_global)  # [B, 1]
+        freq_conf = self.confidence_net(freq_global)  # [B, 1]
+
+        # 融合预测（考虑置信度）
+        conf_weights = torch.cat([time_conf, freq_conf], dim=-1)  # [B, 2]
+        final_weights = attention_weights * conf_weights
+        final_weights = F.softmax(final_weights, dim=-1)  # 重新归一化
+
+        # 加权融合
+        final_pred = (final_weights[:, 0:1].unsqueeze(1) * time_pred +
+                      final_weights[:, 1:2].unsqueeze(1) * freq_pred)
+
+        return final_pred, {
+            'attention_weights': attention_weights,
+            'confidence_weights': conf_weights,
+            'final_weights': final_weights,
+            'time_confidence': time_conf,
+            'freq_confidence': freq_conf
         }
 
-        # 创建总的epoch进度条
-        epoch_pbar = tqdm(range(max_epochs), desc="Training Epochs", unit="epoch")
 
-        for epoch in epoch_pbar:
-            iter_count = 0
-            train_loss = []
-            self.model.train()
-            epoch_time = time.time()
+class Model(nn.Module):
+    """预测级融合双分支模型"""
 
-            # 为每个epoch的batch创建进度条
-            batch_pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{max_epochs}",
-                              leave=False, unit="batch")
+    def __init__(self, configs):
+        super().__init__()
+        self.configs = configs
+        self.task_name = configs.task_name
+        self.seq_len = configs.seq_len
+        self.pred_len = configs.pred_len
 
-            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(batch_pbar):
-                iter_count += 1
-                model_optim.zero_grad()
+        # 1. 通道注意力机制（放在最前端）
+        self.channel_attention = ChannelAttentionModule(configs.enc_in, reduction=8)
 
-                batch_x = batch_x.float().to(self.device)
-                batch_y = batch_y.float().to(self.device)
-                batch_x_mark = batch_x_mark.float().to(self.device)
-                batch_y_mark = batch_y_mark.float().to(self.device)
+        # 2. 分解模块
+        self.decomposition = series_decomp(configs.moving_avg)
 
-                # 前向传播
-                outputs = self.model(batch_x, batch_x_mark, None, batch_y_mark)
-
-                f_dim = -1 if self.args.features == 'MS' else 0
-                outputs = outputs[:, -self.args.pred_len:, f_dim:]
-                batch_y = batch_y[:, -self.args.pred_len:, f_dim:]
-
-                loss = criterion(outputs, batch_y)
-                train_loss.append(loss.item())
-
-                # 更新：batch进度条显示当前loss
-                batch_pbar.set_postfix({'Loss': f"{loss.item():.6f}"})
-
-                if (i + 1) % 100 == 0:
-                    speed = (time.time() - time_now) / iter_count
-                    left_time = speed * ((max_epochs - epoch) * train_steps - i)
-                    tqdm.write(f"\titers: {i + 1}, epoch: {epoch + 1} | loss: {loss.item():.7f}")
-                    tqdm.write(f'\tspeed: {speed:.4f}s/iter; left time: {left_time:.4f}s')
-                    iter_count = 0
-                    time_now = time.time()
-
-                loss.backward()
-                model_optim.step()
-
-                if self.args.lradj == 'TST':
-                    scheduler.step()
-
-            batch_pbar.close()
-
-            epoch_cost_time = time.time() - epoch_time
-            train_loss = np.average(train_loss)
-            vali_loss, vali_r2 = self.vali(vali_data, vali_loader, criterion)
-            test_loss, test_r2 = self.vali(test_data, test_loader, criterion)
-
-            # 记录历史
-            train_history['train_loss'].append(train_loss)
-            train_history['vali_loss'].append(vali_loss)
-            train_history['vali_r2'].append(vali_r2)
-            train_history['test_loss'].append(test_loss)
-            train_history['test_r2'].append(test_r2)
-
-            # 使用tqdm.write输出结果，避免与进度条冲突
-            tqdm.write(f"Epoch: {epoch + 1} cost time: {epoch_cost_time:.2f}s")
-            tqdm.write(
-                f"Epoch: {epoch + 1}, Steps: {train_steps} | Train Loss: {train_loss:.7f} Vali Loss: {vali_loss:.7f} Test Loss: {test_loss:.7f}")
-            tqdm.write(f"Vali R²: {vali_r2:.4f} Test R²: {test_r2:.4f}")
-
-            # 更新：epoch进度条显示当前指标
-            epoch_pbar.set_postfix({
-                'Train_Loss': f"{train_loss:.6f}",
-                'Vali_R2': f"{vali_r2:.4f}",
-                'Test_R2': f"{test_r2:.4f}"
-            })
-
-            adjust_learning_rate(model_optim, epoch + 1, self.args)
-            early_stopping(vali_loss, self.model, path)
-            if early_stopping.early_stop:
-                tqdm.write("Early stopping triggered!")
-                tqdm.write(f"Training stopped at epoch {epoch + 1}")
-                break
-
-        epoch_pbar.close()
-
-        # 保存训练历史
-        history_file = os.path.join(path, f'training_history_{self.experiment_timestamp}.json')
-        train_history_serializable = {}
-        for key, value in train_history.items():
-            train_history_serializable[key] = [float(x) for x in value]
-
-        import json
-        with open(history_file, 'w') as f:
-            json.dump(train_history_serializable, f, indent=2)
-
-        best_model_path = path + '/' + 'checkpoint.pth'
-        self.model.load_state_dict(torch.load(best_model_path))
-
-        # 最终训练完成后计算训练集R²
-        tqdm.write("Computing final training metrics...")
-        final_train_loss, final_train_r2 = self.train_step_metrics(train_loader, criterion)
-        tqdm.write(f"Final Training R²: {final_train_r2:.6f}")
-
-    def train_step_metrics(self, train_loader, criterion):
-        """计算训练集上的R²指标（可选调用）"""
-        train_preds = []
-        train_trues = []
-        train_loss = []
-
-        self.model.eval()
-        with torch.no_grad():
-            # 添加：为训练集指标计算添加进度条
-            metric_pbar = tqdm(enumerate(train_loader), desc="Computing train metrics",
-                               total=min(100, len(train_loader)), leave=False)
-
-            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in metric_pbar:
-                if i >= 100:  # 只计算前100个batch，避免计算时间过长
-                    break
-
-                batch_x = batch_x.float().to(self.device)
-                batch_y = batch_y.float().to(self.device)
-                batch_x_mark = batch_x_mark.float().to(self.device)
-                batch_y_mark = batch_y_mark.float().to(self.device)
-
-                outputs = self.model(batch_x, batch_x_mark, None, batch_y_mark)
-
-                f_dim = -1 if self.args.features == 'MS' else 0
-                outputs = outputs[:, -self.args.pred_len:, f_dim:]
-                batch_y = batch_y[:, -self.args.pred_len:, f_dim:]
-
-                loss = criterion(outputs, batch_y)
-                train_loss.append(loss.item())
-
-                train_preds.append(outputs.detach().cpu().numpy())
-                train_trues.append(batch_y.detach().cpu().numpy())
-
-            metric_pbar.close()
-
-        if train_preds:
-            train_preds = np.concatenate(train_preds, axis=0)
-            train_trues = np.concatenate(train_trues, axis=0)
-            # 修复：使用与vali函数相同的R²计算方式
-            _, _, _, _, _ = metric(train_preds, train_trues)
-            from sklearn.metrics import r2_score
-            train_r2 = r2_score(train_trues.flatten(), train_preds.flatten())
+        # 3. 嵌入层
+        if configs.channel_independence == 1:
+            self.enc_embedding = DataEmbedding_wo_pos(1, configs.d_model, configs.embed, configs.freq, configs.dropout)
         else:
-            train_r2 = 0.0
+            self.enc_embedding = DataEmbedding_wo_pos(configs.enc_in, configs.d_model, configs.embed, configs.freq,
+                                                      configs.dropout)
 
-        self.model.train()
-        return np.average(train_loss), train_r2
+        # 4. 时域分支（独立预测）
+        self.time_branch = TimeDomainBranch(configs)
 
-    def test(self, setting, test=0):
-        test_data, test_loader = self._get_data(flag='test')
+        # 5. 频域分支（独立预测）
+        self.freq_branch = FrequencyDomainBranch(configs)
 
-        # 修改：添加时间戳到设置
-        timestamped_setting = f"{setting}_{self.experiment_timestamp}"
+        # 6. 预测级注意力融合
+        self.prediction_attention = PredictionLevelAttention(configs)
 
-        if test:
-            print('loading model')
-            self.model.load_state_dict(
-                torch.load(os.path.join('./checkpoints/' + timestamped_setting, 'checkpoint.pth')))
+        # 7. 归一化
+        self.normalize_layers = torch.nn.ModuleList([
+            Normalize(configs.enc_in, affine=True, non_norm=True if configs.use_norm == 0 else False)
+            for i in range(configs.down_sampling_layers + 1)
+        ])
 
-        preds = []
-        trues = []
-
-        # 修改：创建带时间戳的测试结果文件夹
-        folder_path = './test_results/' + timestamped_setting + '/'
-        if not os.path.exists(folder_path):
-            os.makedirs(folder_path)
-
-        self.model.eval()
-        with torch.no_grad():
-            test_pbar = tqdm(test_loader, desc="Testing", unit="batch")
-
-            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(test_pbar):
-                batch_x = batch_x.float().to(self.device)
-                batch_y = batch_y.float().to(self.device)
-                batch_x_mark = batch_x_mark.float().to(self.device)
-                batch_y_mark = batch_y_mark.float().to(self.device)
-
-                outputs = self.model(batch_x, batch_x_mark, None, batch_y_mark)
-
-                f_dim = -1 if self.args.features == 'MS' else 0
-                outputs = outputs[:, -self.args.pred_len:, f_dim:]
-                batch_y = batch_y[:, -self.args.pred_len:, f_dim:]
-
-                pred = outputs.detach().cpu().numpy()
-                true = batch_y.detach().cpu().numpy()
-
-                preds.append(pred)
-                trues.append(true)
-
-            test_pbar.close()
-
-        preds = np.concatenate(preds, axis=0)
-        trues = np.concatenate(trues, axis=0)
-
-        mae, mse, rmse, mape, mspe = metric(preds, trues)
-        from sklearn.metrics import r2_score
-        r2 = r2_score(trues.flatten(), preds.flatten())
-        print(f'mse:{mse:.6f}, mae:{mae:.6f}')
-        print(f'rmse:{rmse:.6f}, mape:{mape:.6f}, mspe:{mspe:.6f}')
-        print(f'R²:{r2:.6f}')
-
-        # 修改：保存结果到带时间戳的文件夹
-        folder_path = './results/' + timestamped_setting + '/'
-        if not os.path.exists(folder_path):
-            os.makedirs(folder_path)
-
-        # === 反归一化逻辑保持不变 ===
-        print("开始反归一化处理...")
-        print(f"原始preds形状: {preds.shape}")
-        print(f"原始trues形状: {trues.shape}")
-
-        # 获取原始测试数据
-        raw_df = test_data.raw_test_df
-        print("原始数据列名:", raw_df.columns.tolist())
-
-        # 计算预测数据的数量
-        num_preds = len(preds.flatten())
-        print(f"预测数据点数量: {num_preds}")
-
-        # 方法1：如果features=='S'（单变量），直接反归一化
-        if self.args.features == 'S':
-            print("使用单变量反归一化方法")
-            preds_unscaled = test_data.inverse_transform(preds.reshape(-1, 1)).flatten()
-            trues_unscaled = test_data.inverse_transform(trues.reshape(-1, 1)).flatten()
+    def forward(self, x_enc, x_mark_enc, x_dec=None, x_mark_dec=None, mask=None):
+        if self.task_name == 'long_term_forecast':
+            return self.forecast(x_enc, x_mark_enc)
         else:
-            print("使用多变量反归一化方法")
-            feature_dim = test_data.data_x.shape[-1]
-            print(f"特征维度: {feature_dim}")
+            raise ValueError('Only long_term_forecast implemented')
 
-            if hasattr(test_data, 'scaler'):
-                test_mean = np.mean(test_data.data_x, axis=0)
+    def forecast(self, x_enc, x_mark_enc=None):
+        B, T, N = x_enc.size()
 
-                preds_full = np.tile(test_mean, (num_preds, 1))
-                preds_full[:, -1] = preds.flatten()
+        # 1. 归一化
+        x_enc = self.normalize_layers[0](x_enc, 'norm')
 
-                trues_full = np.tile(test_mean, (num_preds, 1))
-                trues_full[:, -1] = trues.flatten()
+        # 2. 通道注意力（最前端）
+        x_attended = self.channel_attention(x_enc)
 
-                preds_unscaled = test_data.inverse_transform(preds_full)[:, -1]
-                trues_unscaled = test_data.inverse_transform(trues_full)[:, -1]
-            else:
-                print("警告：无法找到scaler，使用原始数据")
-                preds_unscaled = preds.flatten()
-                trues_unscaled = trues.flatten()
+        # 3. 分解
+        seasonal, trend = self.decomposition(x_attended)
+        residual = x_attended - seasonal - trend
 
-        print(f"反归一化后预测值范围: [{preds_unscaled.min():.6f}, {preds_unscaled.max():.6f}]")
-        print(f"反归一化后真实值范围: [{trues_unscaled.min():.6f}, {trues_unscaled.max():.6f}]")
+        # 4. 处理通道独立性
+        if self.configs.channel_independence == 1:
+            seasonal = seasonal.permute(0, 2, 1).contiguous().reshape(B * N, T, 1)
+            trend = trend.permute(0, 2, 1).contiguous().reshape(B * N, T, 1)
+            residual = residual.permute(0, 2, 1).contiguous().reshape(B * N, T, 1)
+            if x_mark_enc is not None:
+                x_mark_enc = x_mark_enc.repeat(N, 1, 1)
 
-        # 获取对应的cycle数据
-        start_idx = self.args.seq_len
-        end_idx = start_idx + num_preds
+        # 5. 嵌入
+        seasonal_emb = self.enc_embedding(seasonal, x_mark_enc)
+        trend_emb = self.enc_embedding(trend, x_mark_enc)
+        residual_emb = self.enc_embedding(residual, x_mark_enc)
 
-        print(f"从原始数据获取cycle，索引范围: {start_idx} 到 {end_idx}")
-        print(f"原始数据长度: {len(raw_df)}")
+        # 6. 双分支独立预测
+        time_pred, time_features = self.time_branch(seasonal_emb, trend_emb, residual_emb)
+        freq_pred, freq_features = self.freq_branch(seasonal_emb, trend_emb, residual_emb)
 
-        # 检查数据集中是否有Cycle列
-        cycle_col = None
-        date_col = None
+        # 7. 预测级注意力融合
+        final_pred, attention_info = self.prediction_attention(
+            time_pred, freq_pred, time_features, freq_features
+        )
 
-        possible_cycle_names = ['Cycle', 'cycle', 'CYCLE', 'cycle_number', 'Cycle_Number']
-        for col in possible_cycle_names:
-            if col in raw_df.columns:
-                cycle_col = col
-                break
+        # 8. 输出重塑
+        if self.configs.channel_independence == 1:
+            final_pred = final_pred.reshape(B, N, self.pred_len, -1)
+            if final_pred.shape[-1] == 1:
+                final_pred = final_pred.squeeze(-1)
+            final_pred = final_pred.permute(0, 2, 1).contiguous()
 
-        possible_date_names = ['date', 'Date', 'DATE', 'time', 'Time', 'timestamp']
-        for col in possible_date_names:
-            if col in raw_df.columns:
-                date_col = col
-                break
+        # 确保输出维度正确
+        if final_pred.shape[-1] > self.configs.c_out:
+            final_pred = final_pred[..., :self.configs.c_out]
 
-        print(f"找到的Cycle列: {cycle_col}")
-        print(f"找到的Date列: {date_col}")
+        # 9. 反归一化
+        final_pred = self.normalize_layers[0](final_pred, 'denorm')
 
-        if end_idx <= len(raw_df):
-            if cycle_col is not None:
-                cycle_data = raw_df[cycle_col].values[start_idx:end_idx]
-                print("使用数据集中的Cycle列")
-            else:
-                cycle_data = np.arange(start_idx + 1, end_idx + 1)
-                print("数据集中没有Cycle列，使用生成的序号")
+        # 存储注意力信息供分析使用
+        self.last_attention_info = attention_info
 
-            if date_col is not None:
-                date_data = raw_df[date_col].values[start_idx:end_idx]
-            else:
-                date_data = None
+        return final_pred
 
-            true_targets = raw_df[self.args.target].values[start_idx:end_idx]
+    def get_branch_contributions(self):
+        """获取各分支的贡献度分析"""
+        if hasattr(self, 'last_attention_info'):
+            return self.last_attention_info
         else:
-            print("警告：索引超出范围，调整索引")
-            if cycle_col is not None:
-                cycle_data = raw_df[cycle_col].values[-num_preds:]
-            else:
-                cycle_data = np.arange(len(raw_df) - num_preds + 1, len(raw_df) + 1)
-
-            if date_col is not None:
-                date_data = raw_df[date_col].values[-num_preds:]
-            else:
-                date_data = None
-
-            true_targets = raw_df[self.args.target].values[-num_preds:]
-
-        print(f"获取的cycle数据长度: {len(cycle_data)}")
-        print(f"cycle数据类型: {type(cycle_data[0])}")
-        print(f"cycle数据前5个: {cycle_data[:5]}")
-        print(f"获取的真实target长度: {len(true_targets)}")
-        print(f"真实target范围: [{true_targets.min():.6f}, {true_targets.max():.6f}]")
-
-        min_length = min(len(cycle_data), len(true_targets), len(preds_unscaled))
-        print(f"最终使用的数据长度: {min_length}")
-
-        # 修改：创建结果DataFrame时添加实验信息
-        results_df = pd.DataFrame({
-            'Cycle': cycle_data[:min_length],
-            'True_Target': true_targets[:min_length],
-            'Predicted_Target': preds_unscaled[:min_length]
-        })
-
-        # 添加实验元信息
-        experiment_info = pd.DataFrame({
-            'Experiment_Timestamp': [self.detailed_timestamp] * min_length,
-            'Model_Name': [self.args.model] * min_length,
-            'Dataset': [self.args.data] * min_length,
-            'Data_Path': [self.args.data_path] * min_length,
-            'MSE': [mse] * min_length,
-            'MAE': [mae] * min_length,
-            'RMSE': [rmse] * min_length,
-            'R2': [r2] * min_length,
-            'Final_d_model': [self.args.d_model] * min_length,
-            'Final_learning_rate': [self.args.learning_rate] * min_length,
-            'Final_dropout': [self.args.dropout] * min_length,
-        })
-
-        # 合并实验信息和结果
-        detailed_results_df = pd.concat([experiment_info, results_df], axis=1)
-
-        # 保存详细结果CSV文件
-        results_csv_path = os.path.join(folder_path, f'forecast_results_{self.experiment_timestamp}.csv')
-        detailed_results_df.to_csv(results_csv_path, index=False)
-        print(f"详细结果已保存至 {results_csv_path}")
-
-        # 同时保存简化版本（保持原有格式兼容性）
-        simple_results_csv_path = os.path.join(folder_path, 'forecast_results.csv')
-        results_df.to_csv(simple_results_csv_path, index=False)
-        print(f"简化结果已保存至 {simple_results_csv_path}")
-
-        print("前5行结果预览:")
-        print(results_df.head())
-
-        print("开始生成可视化图表...")
-
-        # 设置matplotlib的科技论文风格
-        plt.style.use('seaborn-v0_8-whitegrid')
-        sns.set_palette("husl")
-
-        # 创建图形和轴
-        fig, ax = plt.subplots(figsize=(12, 8), dpi=300)
-
-        # 确定x轴数据：优先使用Cycle，如果用户明确需要date则使用date
-        # 这里我们使用Cycle作为x轴，因为这是电池研究的标准做法
-        x_data = cycle_data[:min_length]
-        x_label = 'Cycle'
-
-        print(f"使用x轴数据: {x_label}")
-        print(f"x轴数据范围: {x_data.min()} 到 {x_data.max()}")
-
-        # 绘制真实值（蓝线）
-        ax.plot(x_data, true_targets[:min_length],
-                color='#2E86AB', linewidth=2.5, alpha=0.8,
-                label='True SoH', marker='o', markersize=3, markevery=max(1, min_length // 50))
-
-        # 绘制预测值（红线）
-        ax.plot(x_data, preds_unscaled[:min_length],
-                color='#F24236', linewidth=2.5, alpha=0.8,
-                label='Predicted SoH', marker='s', markersize=3, markevery=max(1, min_length // 50))
-
-        # 设置标题和标签
-        ax.set_title('Battery SoH Prediction - Dual Branch Model', fontsize=20, fontweight='bold', pad=20)
-        ax.set_ylabel('State of Health (SoH)', fontsize=14, fontweight='bold')
-        ax.set_xlabel(x_label, fontsize=14, fontweight='bold')
-
-        # 设置网格
-        ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.8)
-        ax.set_axisbelow(True)
-
-        # 添加图例（右上角）
-        legend = ax.legend(loc='upper right', fontsize=12, frameon=True,
-                           fancybox=True, shadow=True, framealpha=0.9,
-                           bbox_to_anchor=(0.98, 0.98))
-        legend.get_frame().set_facecolor('white')
-        legend.get_frame().set_edgecolor('gray')
-        legend.get_frame().set_linewidth(0.8)
-
-        # 添加性能指标文本框（右上角，图例下方）
-        textstr = f'MAE: {mae:.4f}\nMSE: {mse:.4f}\nRMSE: {rmse:.4f}\nR²: {r2:.4f}'
-        props = dict(boxstyle='round,pad=0.5', facecolor='lightgray', alpha=0.8, edgecolor='gray')
-        ax.text(0.98, 0.75, textstr, transform=ax.transAxes, fontsize=10,
-                verticalalignment='top', horizontalalignment='right',
-                bbox=props, family='monospace')
-
-        # 设置轴的范围和刻度
-        y_min, y_max = min(np.min(true_targets[:min_length]), np.min(preds_unscaled[:min_length])), \
-            max(np.max(true_targets[:min_length]), np.max(preds_unscaled[:min_length]))
-        y_range = y_max - y_min
-        ax.set_ylim(y_min - 0.05 * y_range, y_max + 0.05 * y_range)
-
-        # 美化刻度
-        ax.tick_params(axis='both', which='major', labelsize=11, width=1.2, length=6)
-        ax.tick_params(axis='both', which='minor', width=0.8, length=3)
-
-        # 设置边框
-        for spine in ax.spines.values():
-            spine.set_linewidth(1.2)
-            spine.set_color('gray')
-
-        # 添加阴影区域显示预测误差
-        error = np.abs(true_targets[:min_length] - preds_unscaled[:min_length])
-        ax.fill_between(x_data,
-                        preds_unscaled[:min_length] - error / 2,
-                        preds_unscaled[:min_length] + error / 2,
-                        alpha=0.2, color='red', label='Prediction Error Band')
-
-        # 调整布局
-        plt.tight_layout()
-
-        # 保存高质量图片
-        plot_path = os.path.join(folder_path, 'dual_branch_battery_soh_prediction.png')
-        plt.savefig(plot_path, dpi=300, bbox_inches='tight',
-                    facecolor='white', edgecolor='none')
-
-        # 同时保存PDF格式（适合论文使用）
-        pdf_path = os.path.join(folder_path, 'dual_branch_battery_soh_prediction.pdf')
-        plt.savefig(pdf_path, bbox_inches='tight',
-                    facecolor='white', edgecolor='none')
-
-        print(f"可视化图表已保存:")
-        print(f"PNG格式: {plot_path}")
-        print(f"PDF格式: {pdf_path}")
-
-        # 显示图表（可选，如果在jupyter notebook中运行）
-        plt.show()
-        plt.close()
-
-        # =================== 可视化功能结束 ===================
-
-        # 保存指标
-        np.save(folder_path + f'metrics_{self.experiment_timestamp}.npy', np.array([mae, mse, rmse, mape, mspe, r2]))
-        np.save(folder_path + f'pred_{self.experiment_timestamp}.npy', preds)
-        np.save(folder_path + f'true_{self.experiment_timestamp}.npy', trues)
-
-        # 修改：保存到带时间戳的文本文件
-        result_file = f"result_dual_branch_forecast_{self.experiment_timestamp}.txt"
-        f = open(result_file, 'a', encoding='utf-8')
-        f.write(f"Experiment Time: {self.detailed_timestamp}\n")
-        f.write(f"Dataset: {self.args.data_path}\n")
-        f.write(f"Model: {self.args.model}\n")
-        f.write(timestamped_setting + "\n")
-        f.write(f'mse:{mse:.6f}, mae:{mae:.6f}, rmse:{rmse:.6f}, mape:{mape:.6f}, mspe:{mspe:.6f}, R2:{r2:.6f}\n')
-        f.write('\n')
-        f.close()
-
-        # 同时保存到总的结果文件（保持原有逻辑）
-        f = open("result_dual_branch_forecast.txt", 'a', encoding='utf-8')
-        f.write(f"[{self.detailed_timestamp}] " + timestamped_setting + "\n")
-        f.write(f'mse:{mse:.6f}, mae:{mae:.6f}, rmse:{rmse:.6f}, mape:{mape:.6f}, mspe:{mspe:.6f}, R2:{r2:.6f}\n')
-        f.write('\n')
-        f.close()
-
-        return
+            return None

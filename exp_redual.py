@@ -1,5 +1,5 @@
 from exp.exp_basic import Exp_Basic
-from models import dual  # 修改：导入新的双分支模型
+from models import redual  # 修改：导入新的双分支模型
 from data_provider.data_factory import data_provider
 from utils.tools import EarlyStopping, adjust_learning_rate
 from utils.metrics import metric

@@ -2,15 +2,96 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from layers.Autoformer_EncDec import series_decomp
 from layers.Embed import DataEmbedding_wo_pos
 from layers.StandardNorm import Normalize
 from layers.ChebyKANLayer import ChebyKANLinear
 from layers.TimeDART_EncDec import Diffusion
+from pytorch_wavelets import DWT1DForward, DWT1DInverse
+from utils.RevIN import RevIN
+
+
+class WaveletDecomposition(nn.Module):
+    """多级小波分解模块 - 基于WPMixer设计"""
+
+    def __init__(self, wavelet_name='db4', level=3, channel=1, device='cuda', use_amp=False):
+        super().__init__()
+        self.wavelet_name = wavelet_name
+        self.level = level
+        self.channel = channel
+        self.device_type = device
+        self.use_amp = use_amp
+
+        # 初始化小波变换
+        if device == 'cuda':
+            self.dwt = DWT1DForward(wave=wavelet_name, J=level, use_amp=use_amp).cuda()
+            self.idwt = DWT1DInverse(wave=wavelet_name, use_amp=use_amp).cuda()
+        else:
+            self.dwt = DWT1DForward(wave=wavelet_name, J=level, use_amp=use_amp)
+            self.idwt = DWT1DInverse(wave=wavelet_name, use_amp=use_amp)
+
+        # RevIN归一化
+        self.revin_components = nn.ModuleList([
+            RevIN(channel, eps=1e-5, affine=True, subtract_last=False)
+            for _ in range(level + 1)
+        ])
+
+    def forward(self, x):
+        """
+        Args:
+            x: [B, T, C] 输入时序数据
+        Returns:
+            components: 分解后的各小波系数 [approximation, detail1, detail2, ...]
+        """
+        B, T, C = x.shape
+
+        # 转换维度: [B, T, C] -> [B, C, T]
+        x = x.transpose(1, 2)
+
+        # 小波分解
+        yl, yh = self.dwt(x)  # yl: 近似系数, yh: 细节系数列表
+
+        # 组织分解结果
+        components = []
+
+        # 近似系数归一化 [B, C, T_approx] -> [B, T_approx, C]
+        yl = yl.transpose(1, 2)
+        yl_norm = self.revin_components[0](yl, 'norm')
+        components.append(yl_norm.transpose(1, 2))  # 转回 [B, C, T_approx]
+
+        # 各级细节系数归一化
+        for i, yh_i in enumerate(yh):
+            yh_i = yh_i.transpose(1, 2)  # [B, C, T_detail] -> [B, T_detail, C]
+            yh_i_norm = self.revin_components[i + 1](yh_i, 'norm')
+            components.append(yh_i_norm.transpose(1, 2))  # 转回 [B, C, T_detail]
+
+        return components
+
+    def inverse_transform(self, components):
+        """
+        Args:
+            components: 各小波系数 [approximation, detail1, detail2, ...]
+        Returns:
+            x: [B, T, C] 重构的时序数据
+        """
+        # 反归一化
+        yl = components[0].transpose(1, 2)  # [B, C, T] -> [B, T, C]
+        yl = self.revin_components[0](yl, 'denorm')
+        yl = yl.transpose(1, 2)  # [B, T, C] -> [B, C, T]
+
+        yh = []
+        for i, comp in enumerate(components[1:]):
+            comp = comp.transpose(1, 2)  # [B, C, T] -> [B, T, C]
+            comp = self.revin_components[i + 1](comp, 'denorm')
+            yh.append(comp.transpose(1, 2))  # [B, T, C] -> [B, C, T]
+
+        # 小波重构
+        x = self.idwt((yl, yh))  # [B, C, T]
+
+        return x.transpose(1, 2)  # [B, C, T] -> [B, T, C]
 
 
 class ChannelAttentionModule(nn.Module):
-    """通道注意力机制 - 放在模型最前端"""
+    """通道注意力机制"""
 
     def __init__(self, channels, reduction=8):
         super().__init__()
@@ -25,230 +106,132 @@ class ChannelAttentionModule(nn.Module):
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        # x: [B, T, C]
         B, T, C = x.shape
 
-        # 全局平均池化和最大池化
-        avg_out = self.fc(self.avg_pool(x.transpose(1, 2)).squeeze(-1))  # [B, C]
-        max_out = self.fc(self.max_pool(x.transpose(1, 2)).squeeze(-1))  # [B, C]
+        avg_out = self.fc(self.avg_pool(x.transpose(1, 2)).squeeze(-1))
+        max_out = self.fc(self.max_pool(x.transpose(1, 2)).squeeze(-1))
 
-        # 注意力权重
-        attention_weights = self.sigmoid(avg_out + max_out).unsqueeze(1)  # [B, 1, C]
-
-        # 应用注意力权重
+        attention_weights = self.sigmoid(avg_out + max_out).unsqueeze(1)
         return x * attention_weights
 
 
-class FourierBlock(nn.Module):
-    """频域特征提取模块（基于论文中的FNN设计）"""
+class WaveletComponentProcessor(nn.Module):
+    """小波系数专用处理器"""
 
-    def __init__(self, d_model, seq_len):
+    def __init__(self, d_model, component_type='approximation'):
         super().__init__()
-        self.d_model = d_model
-        self.seq_len = seq_len
+        self.component_type = component_type
 
-        # 频域映射层
-        self.freq_mapping = nn.Linear(d_model, d_model)
+        # 根据分量类型选择不同的处理策略
+        if component_type == 'approximation':
+            # 近似系数：低频信息，使用较低阶的KAN
+            self.kan_layer = ChebyKANLinear(d_model, d_model, order=3)
+            self.conv = nn.Conv1d(d_model, d_model, kernel_size=5, padding=2, groups=d_model)
+        else:
+            # 细节系数：高频信息，使用较高阶的KAN
+            self.kan_layer = ChebyKANLinear(d_model, d_model, order=5)
+            self.conv = nn.Conv1d(d_model, d_model, kernel_size=3, padding=1, groups=d_model)
 
-        # 多头自注意力机制用于频域特征学习
-        self.multihead_attn = nn.MultiheadAttention(d_model, num_heads=8, dropout=0.1, batch_first=True)
+        self.norm = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(0.1)
 
-        # 频域特征变换
-        self.freq_transform = nn.Sequential(
-            nn.Linear(d_model, d_model * 2),
-            nn.GELU(),
-            nn.Linear(d_model * 2, d_model),
-            nn.Dropout(0.1)
+    def forward(self, x):
+        """
+        Args:
+            x: [B, T, C] 小波系数嵌入
+        """
+        B, T, C = x.shape
+
+        # KAN处理
+        x_kan = self.kan_layer(x.reshape(B * T, C)).reshape(B, T, C)
+
+        # 卷积处理
+        x_conv = self.conv(x.transpose(1, 2)).transpose(1, 2)
+
+        # 残差连接和归一化
+        return self.norm(x + self.dropout(x_kan + x_conv))
+
+
+class EnhancedFrequencyBranch(nn.Module):
+    """增强的频域分支 - 基于多级小波分解"""
+
+    def __init__(self, args):
+        super().__init__()
+        self.args = args
+        self.level = getattr(args, 'wavelet_level', 3)
+
+        # 为各小波系数创建专用处理器
+        self.component_processors = nn.ModuleList([
+            WaveletComponentProcessor(args.d_model, 'approximation')  # 近似系数
+        ])
+
+        # 各级细节系数处理器
+        for i in range(self.level):
+            self.component_processors.append(
+                WaveletComponentProcessor(args.d_model, f'detail_{i + 1}')
+            )
+
+        # 多头注意力用于分量间交互
+        self.cross_component_attention = nn.MultiheadAttention(
+            args.d_model, num_heads=4, dropout=0.1, batch_first=True
         )
 
-        # 逆FFT后的处理
-        self.ifft_proj = nn.Linear(d_model, d_model)
-
-    def forward(self, x):
-        # x: [B, T, C]
-        B, T, C = x.shape
-
-        # 映射到高维空间
-        x_mapped = self.freq_mapping(x)
-
-        # FFT变换到频域
-        x_freq = torch.fft.rfft(x_mapped, dim=1)  # [B, T//2+1, C]
-        x_freq_real = torch.cat([x_freq.real, x_freq.imag], dim=-1)  # [B, T//2+1, 2C]
-
-        # 调整维度以匹配d_model
-        if x_freq_real.shape[-1] != self.d_model:
-            # 创建一个可学习的线性层来调整维度
-            if not hasattr(self, 'freq_dim_adapter'):
-                self.freq_dim_adapter = nn.Linear(x_freq_real.shape[-1], self.d_model).to(x.device)
-            x_freq_real = self.freq_dim_adapter(x_freq_real)
-
-        # 自注意力机制学习频域特征
-        freq_attn_out, _ = self.multihead_attn(x_freq_real, x_freq_real, x_freq_real)
-
-        # 频域特征变换
-        freq_features = self.freq_transform(freq_attn_out)
-
-        # IFFT回到时域
-        # 处理维度以进行IFFT
-        if freq_features.shape[-1] >= self.d_model // 2:
-            # 分离实部和虚部
-            half_dim = freq_features.shape[-1] // 2
-            freq_real = freq_features[..., :half_dim]
-            freq_imag = freq_features[..., half_dim:half_dim * 2] if freq_features.shape[
-                                                                         -1] > half_dim else torch.zeros_like(freq_real)
-            freq_complex = torch.complex(freq_real, freq_imag)
-        else:
-            # 如果维度不足，用零填充虚部
-            freq_complex = torch.complex(freq_features, torch.zeros_like(freq_features))
-
-        # 确保频域序列长度正确
-        if freq_complex.shape[1] != (T // 2 + 1):
-            # 调整频域序列长度
-            target_freq_len = T // 2 + 1
-            current_freq_len = freq_complex.shape[1]
-            if current_freq_len > target_freq_len:
-                freq_complex = freq_complex[:, :target_freq_len, :]
-            else:
-                # 用零填充
-                pad_len = target_freq_len - current_freq_len
-                pad_tensor = torch.zeros(freq_complex.shape[0], pad_len, freq_complex.shape[2],
-                                         dtype=freq_complex.dtype, device=freq_complex.device)
-                freq_complex = torch.cat([freq_complex, pad_tensor], dim=1)
-
-        x_ifft = torch.fft.irfft(freq_complex, n=T, dim=1)  # [B, T, C]
-
-        # 最终投影，确保输出维度与输入一致
-        if x_ifft.shape[-1] != C:
-            if not hasattr(self, 'output_adapter'):
-                self.output_adapter = nn.Linear(x_ifft.shape[-1], C).to(x.device)
-            x_ifft = self.output_adapter(x_ifft)
-
-        return self.ifft_proj(x_ifft)
-
-
-class LightweightDiffusion(nn.Module):
-    """轻量级扩散模块"""
-
-    def __init__(self, time_steps=20, device='cuda', scheduler='linear'):
-        super().__init__()
-        self.diffusion = Diffusion(time_steps=time_steps, device=device, scheduler=scheduler)
-
-    def forward(self, x, apply_noise=True):
-        if apply_noise and self.training:
-            return self.diffusion(x)
-        else:
-            return x, None, None
-
-
-class AdaptiveKANMixer(nn.Module):
-    """自适应KAN混合器"""
-
-    def __init__(self, d_model, component_type='trend'):
-        super().__init__()
-        # 根据分量类型选择KAN阶数
-        order_map = {'trend': 3, 'seasonal': 5, 'residual': 4}
-        order = order_map.get(component_type, 4)
-
-        self.kan_layer = ChebyKANLinear(d_model, d_model, order)
-        self.conv = nn.Conv1d(d_model, d_model, kernel_size=3, padding=1, groups=d_model)
-        self.norm = nn.LayerNorm(d_model)
-
-    def forward(self, x):
-        B, T, C = x.shape
-        x_kan = self.kan_layer(x.reshape(B * T, C)).reshape(B, T, C)
-        x_conv = self.conv(x.transpose(1, 2)).transpose(1, 2)
-        return self.norm(x + x_kan + x_conv)
-
-
-class TimeDomainBranch(nn.Module):
-    """时域分支（独立预测）"""
-
-    def __init__(self, configs):
-        super().__init__()
-        self.configs = configs
-
-        # KAN混合器
-        self.trend_mixer = AdaptiveKANMixer(configs.d_model, 'trend')
-        self.seasonal_mixer = AdaptiveKANMixer(configs.d_model, 'seasonal')
-        self.residual_mixer = AdaptiveKANMixer(configs.d_model, 'residual')
-
-        # 轻量级扩散（仅用于seasonal）
-        self.diffusion = LightweightDiffusion(time_steps=20, device=configs.device)
-
         # 特征融合
-        self.feature_fusion = nn.Linear(configs.d_model * 3, configs.d_model)
-
-        # 时域预测头
-        self.temporal_predictor = nn.Linear(configs.seq_len, configs.pred_len)
-
-        # 输出投影
-        if configs.channel_independence == 1:
-            self.output_projection = nn.Linear(configs.d_model, 1)
-        else:
-            self.output_projection = nn.Linear(configs.d_model, configs.c_out)
-
-    def forward(self, seasonal_emb, trend_emb, residual_emb):
-        # 分量处理
-        trend_out = self.trend_mixer(trend_emb)
-
-        # seasonal加入扩散噪声
-        if self.training:
-            seasonal_noise, _, _ = self.diffusion(seasonal_emb, apply_noise=True)
-            seasonal_out = self.seasonal_mixer(seasonal_noise)
-        else:
-            seasonal_out = self.seasonal_mixer(seasonal_emb)
-
-        residual_out = self.residual_mixer(residual_emb)
-
-        # 特征融合
-        combined = torch.cat([trend_out, seasonal_out, residual_out], dim=-1)
-        time_features = self.feature_fusion(combined)
-
-        # 时域预测
-        time_pred = self.temporal_predictor(time_features.transpose(1, 2)).transpose(1, 2)
-        time_output = self.output_projection(time_pred)
-
-        return time_output, time_features
-
-
-class FrequencyDomainBranch(nn.Module):
-    """频域分支（独立预测）"""
-
-    def __init__(self, configs):
-        super().__init__()
-        self.configs = configs
-
-        # 频域处理器
-        self.fourier_trend = FourierBlock(configs.d_model, configs.seq_len)
-        self.fourier_seasonal = FourierBlock(configs.d_model, configs.seq_len)
-        self.fourier_residual = FourierBlock(configs.d_model, configs.seq_len)
-
-        # 频域特征融合
         self.freq_fusion = nn.Sequential(
-            nn.Linear(configs.d_model * 3, configs.d_model * 2),
+            nn.Linear(args.d_model * (self.level + 1), args.d_model * 2),
             nn.GELU(),
-            nn.Linear(configs.d_model * 2, configs.d_model),
+            nn.Linear(args.d_model * 2, args.d_model),
             nn.Dropout(0.1)
         )
 
         # 频域预测头
-        self.temporal_predictor = nn.Linear(configs.seq_len, configs.pred_len)
+        self.temporal_predictor = nn.Linear(args.seq_len, args.pred_len)
 
         # 输出投影
-        if configs.channel_independence == 1:
-            self.output_projection = nn.Linear(configs.d_model, 1)
+        if args.channel_independence == 1:
+            self.output_projection = nn.Linear(args.d_model, 1)
         else:
-            self.output_projection = nn.Linear(configs.d_model, configs.c_out)
+            self.output_projection = nn.Linear(args.d_model, args.c_out)
 
-    def forward(self, seasonal_emb, trend_emb, residual_emb):
-        # 频域处理
-        trend_freq = self.fourier_trend(trend_emb)
-        seasonal_freq = self.fourier_seasonal(seasonal_emb)
-        residual_freq = self.fourier_residual(residual_emb)
+    def forward(self, wavelet_components_emb):
+        """
+        Args:
+            wavelet_components_emb: List of [B, T, d_model] 各小波系数的嵌入
+        """
+        processed_components = []
 
-        # 频域特征融合
-        combined_freq = torch.cat([trend_freq, seasonal_freq, residual_freq], dim=-1)
-        freq_features = self.freq_fusion(combined_freq)
+        # 各分量独立处理
+        for i, (component_emb, processor) in enumerate(zip(wavelet_components_emb, self.component_processors)):
+            processed_comp = processor(component_emb)
+            processed_components.append(processed_comp)
+
+        # 分量间交互注意力
+        if len(processed_components) > 1:
+            # 拼接所有分量 [B, T*(level+1), d_model]
+            all_components = torch.cat(processed_components, dim=1)
+
+            # 自注意力交互
+            attended_components, _ = self.cross_component_attention(
+                all_components, all_components, all_components
+            )
+
+            # 重新分割
+            T = processed_components[0].shape[1]
+            split_components = torch.split(attended_components, T, dim=1)
+        else:
+            split_components = processed_components
+
+        # 在特征维度融合
+        if len(split_components) > 1:
+            # 对齐序列长度（取最短）
+            min_len = min(comp.shape[1] for comp in split_components)
+            aligned_components = [comp[:, :min_len, :] for comp in split_components]
+
+            # 特征维度拼接
+            combined_freq = torch.cat(aligned_components, dim=-1)
+            freq_features = self.freq_fusion(combined_freq)
+        else:
+            freq_features = split_components[0]
 
         # 频域预测
         freq_pred = self.temporal_predictor(freq_features.transpose(1, 2)).transpose(1, 2)
@@ -257,72 +240,146 @@ class FrequencyDomainBranch(nn.Module):
         return freq_output, freq_features
 
 
-class PredictionLevelAttention(nn.Module):
-    """预测级注意力融合模块"""
+class BalancedTimeBranch(nn.Module):
+    """平衡的时域分支 - 简化设计"""
 
-    def __init__(self, configs):
+    def __init__(self, args):
         super().__init__()
-        self.configs = configs
+        self.args = args
 
-        # 注意力计算网络
-        if configs.channel_independence == 1:
+        # 统一KAN混合器（简化版）
+        self.unified_mixer = nn.Sequential(
+            ChebyKANLinear(args.d_model * 3, args.d_model * 2, order=3),
+            nn.GELU(),
+            ChebyKANLinear(args.d_model * 2, args.d_model, order=3),
+            nn.Dropout(0.1)
+        )
+
+        # 简化的正则化模块
+        self.light_regularization = nn.Sequential(
+            nn.Linear(args.d_model, args.d_model),
+            nn.Dropout(0.1),
+            nn.LayerNorm(args.d_model)
+        )
+
+        # 时域预测头
+        self.temporal_predictor = nn.Linear(args.seq_len, args.pred_len)
+
+        # 输出投影
+        if args.channel_independence == 1:
+            self.output_projection = nn.Linear(args.d_model, 1)
+        else:
+            self.output_projection = nn.Linear(args.d_model, args.c_out)
+
+    def forward(self, seasonal_emb, trend_emb, residual_emb):
+        """使用平均长度对齐不同小波系数"""
+        # 获取最小长度
+        min_len = min(seasonal_emb.shape[1], trend_emb.shape[1], residual_emb.shape[1])
+
+        # 截取到相同长度
+        seasonal_aligned = seasonal_emb[:, :min_len, :]
+        trend_aligned = trend_emb[:, :min_len, :]
+        residual_aligned = residual_emb[:, :min_len, :]
+
+        # 特征融合
+        combined = torch.cat([seasonal_aligned, trend_aligned, residual_aligned], dim=-1)
+        time_features = self.unified_mixer(combined)
+
+        # 轻量级正则化
+        time_features = self.light_regularization(time_features)
+
+        # 时域预测
+        time_pred = self.temporal_predictor(time_features.transpose(1, 2)).transpose(1, 2)
+        time_output = self.output_projection(time_pred)
+
+        return time_output, time_features
+
+
+class ProgressiveInteractionAttention(nn.Module):
+    """渐进式交互注意力融合模块 - 基于TwinsFormer设计"""
+
+    def __init__(self, args):
+        super().__init__()
+        self.args = args
+
+        # 多层交互
+        self.interaction_layers = nn.ModuleList([
+            self._build_interaction_layer(args) for _ in range(2)
+        ])
+
+        # 最终注意力权重计算
+        if args.channel_independence == 1:
             input_dim = 1
         else:
-            input_dim = configs.c_out
+            input_dim = args.c_out
 
-        self.attention_net = nn.Sequential(
-            nn.Linear(input_dim * 2 + configs.d_model * 2, configs.d_model),
+        self.final_attention = nn.Sequential(
+            nn.Linear(input_dim * 2 + args.d_model * 2, args.d_model),
             nn.ReLU(),
-            nn.Linear(configs.d_model, configs.d_model // 2),
-            nn.ReLU(),
-            nn.Linear(configs.d_model // 2, 2),  # 2个分支的权重
+            nn.Linear(args.d_model, 2),
             nn.Softmax(dim=-1)
         )
 
-        # 置信度估计网络
+        # 置信度估计
         self.confidence_net = nn.Sequential(
-            nn.Linear(configs.d_model, configs.d_model // 2),
+            nn.Linear(args.d_model, args.d_model // 2),
             nn.ReLU(),
-            nn.Linear(configs.d_model // 2, 1),
+            nn.Linear(args.d_model // 2, 1),
             nn.Sigmoid()
         )
 
+        # 门控机制
+        self.gate_mechanism = nn.Sequential(
+            nn.Conv1d(args.d_model, args.d_model, 1),
+            nn.Sigmoid()
+        )
+
+    def _build_interaction_layer(self, args):
+        return nn.MultiheadAttention(
+            args.d_model, num_heads=4, dropout=0.1, batch_first=True
+        )
+
     def forward(self, time_pred, freq_pred, time_features, freq_features):
-        """
-        Args:
-            time_pred: [B, pred_len, C] 时域预测
-            freq_pred: [B, pred_len, C] 频域预测
-            time_features: [B, seq_len, d_model] 时域特征
-            freq_features: [B, seq_len, d_model] 频域特征
-        """
         B, pred_len = time_pred.shape[:2]
 
-        # 计算全局特征（用于注意力计算）
-        time_global = time_features.mean(dim=1)  # [B, d_model]
-        freq_global = freq_features.mean(dim=1)  # [B, d_model]
+        # 渐进式交互
+        for interaction_layer in self.interaction_layers:
+            # 交互增强
+            enhanced_time, _ = interaction_layer(time_features, freq_features, freq_features)
+            enhanced_freq, _ = interaction_layer(freq_features, time_features, time_features)
 
-        # 计算预测差异（作为注意力的输入）
-        pred_diff = torch.abs(time_pred - freq_pred).mean(dim=1)  # [B, C]
+            # 使用减法机制（参考TwinsFormer）
+            time_features = time_features - enhanced_freq * 0.1
+            freq_features = freq_features - enhanced_time * 0.1
 
-        # 拼接所有特征
+        # 计算全局特征
+        time_global = time_features.mean(dim=1)
+        freq_global = freq_features.mean(dim=1)
+
+        # 预测差异
+        pred_diff = torch.abs(time_pred - freq_pred).mean(dim=1)
+
+        # 注意力权重
         attention_input = torch.cat([
             time_global, freq_global,
             pred_diff, (time_pred + freq_pred).mean(dim=1)
-        ], dim=-1)  # [B, d_model*2 + C*2]
+        ], dim=-1)
 
-        # 计算注意力权重
-        attention_weights = self.attention_net(attention_input)  # [B, 2]
+        attention_weights = self.final_attention(attention_input)
 
-        # 计算置信度
-        time_conf = self.confidence_net(time_global)  # [B, 1]
-        freq_conf = self.confidence_net(freq_global)  # [B, 1]
+        # 置信度
+        time_conf = self.confidence_net(time_global)
+        freq_conf = self.confidence_net(freq_global)
 
-        # 融合预测（考虑置信度）
-        conf_weights = torch.cat([time_conf, freq_conf], dim=-1)  # [B, 2]
+        # 门控融合
+        combined_features = time_features + freq_features
+        gate = self.gate_mechanism(combined_features.transpose(1, 2)).transpose(1, 2)
+
+        # 最终融合
+        conf_weights = torch.cat([time_conf, freq_conf], dim=-1)
         final_weights = attention_weights * conf_weights
-        final_weights = F.softmax(final_weights, dim=-1)  # 重新归一化
+        final_weights = F.softmax(final_weights, dim=-1)
 
-        # 加权融合
         final_pred = (final_weights[:, 0:1].unsqueeze(1) * time_pred +
                       final_weights[:, 1:2].unsqueeze(1) * freq_pred)
 
@@ -336,41 +393,56 @@ class PredictionLevelAttention(nn.Module):
 
 
 class Model(nn.Module):
-    """预测级融合双分支模型"""
+    """改进的预测级融合双分支模型 - 集成多级小波分解"""
 
-    def __init__(self, configs):
+    def __init__(self, args):
         super().__init__()
-        self.configs = configs
-        self.task_name = configs.task_name
-        self.seq_len = configs.seq_len
-        self.pred_len = configs.pred_len
+        self.args = args
+        self.task_name = args.task_name
+        self.seq_len = args.seq_len
+        self.pred_len = args.pred_len
 
-        # 1. 通道注意力机制（放在最前端）
-        self.channel_attention = ChannelAttentionModule(configs.enc_in, reduction=8)
+        # 小波分解参数（使用getattr提供默认值）
+        self.wavelet_name = getattr(args, 'wavelet_name', 'db4')
+        self.wavelet_level = getattr(args, 'wavelet_level', 3)
 
-        # 2. 分解模块
-        self.decomposition = series_decomp(configs.moving_avg)
+        # 1. 通道注意力机制
+        self.channel_attention = ChannelAttentionModule(args.enc_in, reduction=8)
+
+        # 2. 多级小波分解模块
+        self.wavelet_decomposition = WaveletDecomposition(
+            wavelet_name=self.wavelet_name,
+            level=self.wavelet_level,
+            channel=args.enc_in,
+            device=getattr(args, 'device', 'cuda'),
+            use_amp=getattr(args, 'use_amp', False)
+        )
 
         # 3. 嵌入层
-        if configs.channel_independence == 1:
-            self.enc_embedding = DataEmbedding_wo_pos(1, configs.d_model, configs.embed, configs.freq, configs.dropout)
+        if args.channel_independence == 1:
+            self.component_embeddings = nn.ModuleList([
+                DataEmbedding_wo_pos(1, args.d_model, args.embed, args.freq, args.dropout)
+                for _ in range(self.wavelet_level + 1)
+            ])
         else:
-            self.enc_embedding = DataEmbedding_wo_pos(configs.enc_in, configs.d_model, configs.embed, configs.freq,
-                                                      configs.dropout)
+            self.component_embeddings = nn.ModuleList([
+                DataEmbedding_wo_pos(args.enc_in, args.d_model, args.embed, args.freq, args.dropout)
+                for _ in range(self.wavelet_level + 1)
+            ])
 
-        # 4. 时域分支（独立预测）
-        self.time_branch = TimeDomainBranch(configs)
+        # 4. 平衡的时域分支
+        self.time_branch = BalancedTimeBranch(args)
 
-        # 5. 频域分支（独立预测）
-        self.freq_branch = FrequencyDomainBranch(configs)
+        # 5. 增强的频域分支
+        self.freq_branch = EnhancedFrequencyBranch(args)
 
-        # 6. 预测级注意力融合
-        self.prediction_attention = PredictionLevelAttention(configs)
+        # 6. 渐进式交互注意力融合
+        self.progressive_attention = ProgressiveInteractionAttention(args)
 
         # 7. 归一化
         self.normalize_layers = torch.nn.ModuleList([
-            Normalize(configs.enc_in, affine=True, non_norm=True if configs.use_norm == 0 else False)
-            for i in range(configs.down_sampling_layers + 1)
+            Normalize(args.enc_in, affine=True, non_norm=True if args.use_norm == 0 else False)
+            for i in range(args.down_sampling_layers + 1)
         ])
 
     def forward(self, x_enc, x_mark_enc, x_dec=None, x_mark_dec=None, mask=None):
@@ -385,50 +457,68 @@ class Model(nn.Module):
         # 1. 归一化
         x_enc = self.normalize_layers[0](x_enc, 'norm')
 
-        # 2. 通道注意力（最前端）
+        # 2. 通道注意力
         x_attended = self.channel_attention(x_enc)
 
-        # 3. 分解
-        seasonal, trend = self.decomposition(x_attended)
-        residual = x_attended - seasonal - trend
+        # 3. 多级小波分解
+        wavelet_components = self.wavelet_decomposition(x_attended)
 
-        # 4. 处理通道独立性
-        if self.configs.channel_independence == 1:
-            seasonal = seasonal.permute(0, 2, 1).contiguous().reshape(B * N, T, 1)
-            trend = trend.permute(0, 2, 1).contiguous().reshape(B * N, T, 1)
-            residual = residual.permute(0, 2, 1).contiguous().reshape(B * N, T, 1)
-            if x_mark_enc is not None:
-                x_mark_enc = x_mark_enc.repeat(N, 1, 1)
+        # 4. 处理通道独立性并嵌入各小波系数
+        component_embeddings = []
 
-        # 5. 嵌入
-        seasonal_emb = self.enc_embedding(seasonal, x_mark_enc)
-        trend_emb = self.enc_embedding(trend, x_mark_enc)
-        residual_emb = self.enc_embedding(residual, x_mark_enc)
+        for i, component in enumerate(wavelet_components):
+            if self.configs.channel_independence == 1:
+                # [B, C, T] -> [B*N, T, 1]
+                component = component.permute(0, 2, 1).contiguous().reshape(B * N, component.shape[-1], 1)
+                if x_mark_enc is not None:
+                    x_mark_repeated = x_mark_enc.repeat(N, 1, 1)
+                else:
+                    x_mark_repeated = None
+            else:
+                # [B, C, T] -> [B, T, C]
+                component = component.transpose(1, 2)
+                x_mark_repeated = x_mark_enc
 
-        # 6. 双分支独立预测
+            # 嵌入
+            component_emb = self.component_embeddings[i](component, x_mark_repeated)
+            component_embeddings.append(component_emb)
+
+        # 5. 为分支准备输入（使用前3个主要分量）
+        # 近似系数作为trend，第一个细节系数作为seasonal，第二个细节系数作为residual
+        if len(component_embeddings) >= 3:
+            trend_emb = component_embeddings[0]  # 近似系数（低频趋势）
+            seasonal_emb = component_embeddings[1]  # 第一级细节系数
+            residual_emb = component_embeddings[2]  # 第二级细节系数
+        else:
+            # 如果分解级数较少，适当处理
+            trend_emb = component_embeddings[0]
+            seasonal_emb = component_embeddings[1] if len(component_embeddings) > 1 else component_embeddings[0]
+            residual_emb = component_embeddings[-1]
+
+        # 6. 双分支预测
         time_pred, time_features = self.time_branch(seasonal_emb, trend_emb, residual_emb)
-        freq_pred, freq_features = self.freq_branch(seasonal_emb, trend_emb, residual_emb)
+        freq_pred, freq_features = self.freq_branch(component_embeddings)
 
-        # 7. 预测级注意力融合
-        final_pred, attention_info = self.prediction_attention(
+        # 7. 渐进式交互注意力融合
+        final_pred, attention_info = self.progressive_attention(
             time_pred, freq_pred, time_features, freq_features
         )
 
         # 8. 输出重塑
-        if self.configs.channel_independence == 1:
+        if self.args.channel_independence == 1:
             final_pred = final_pred.reshape(B, N, self.pred_len, -1)
             if final_pred.shape[-1] == 1:
                 final_pred = final_pred.squeeze(-1)
             final_pred = final_pred.permute(0, 2, 1).contiguous()
 
         # 确保输出维度正确
-        if final_pred.shape[-1] > self.configs.c_out:
-            final_pred = final_pred[..., :self.configs.c_out]
+        if final_pred.shape[-1] > self.args.c_out:
+            final_pred = final_pred[..., :self.args.c_out]
 
         # 9. 反归一化
         final_pred = self.normalize_layers[0](final_pred, 'denorm')
 
-        # 存储注意力信息供分析使用
+        # 存储注意力信息
         self.last_attention_info = attention_info
 
         return final_pred
